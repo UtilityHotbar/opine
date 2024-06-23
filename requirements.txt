@@ -1,0 +1,5 @@
+requests-html
+anthropic
+xmltodict
+beautifulsoup4
+xmltodict
