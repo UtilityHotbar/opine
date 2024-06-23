@@ -11,7 +11,7 @@ import time
 import random
 import os
 import json
-
+import xmltodict
 
 
 MAX_THREADS= 10
@@ -24,6 +24,26 @@ form = "%(asctime)s: %(message)s"
 logging.basicConfig(format=form, level=logging.INFO, datefmt="%H:%M:%S")
 client = anthropic.Anthropic()
 
+def get_importance_of_case(url):
+    prefix= url.split('/')[1].lower()
+    if prefix == 'uwsc' or prefix == 'uwhl':
+        return 1
+    elif prefix == 'ewca':
+        return 2
+    elif prefix == 'ewhc':
+        return 3
+    else:
+        return 4
+
+def get_prefix(url):
+    prefix= url.split('/')[1].lower()
+    if prefix not in ['uwsc', 'uwhl','ewca','ewhc']:
+        prefix = 'Other'
+        return prefix
+    else:
+        return prefix.upper()
+
+@st.cache_data
 def get_response(msg,  target=None, target_id=None, model="claude-3-5-sonnet-20240620", max_tokens=1000, temperature=0.5,):
     if type(msg) == str:
         messages =[
@@ -75,7 +95,6 @@ def get_article_summary(url: str, summary_dump: dict, article_data: dict):
     summary_dump[url] = get_response(get_template('Hi claude, I have a legal case as a block of html data here, can I get a one-paragraph summary of the spicy parts?', article_data[url], rider="Remember, I want a 1 paragraph summary! Answer with this format:\n<format>summary goes here</format>"))
     logging.info('Summary from '+url+' done')
 
-
 def get_article_contents(url: str, raw_html_dump: dict,titles: dict):
     logging.info('starting request thread for: '+url)
     time.sleep(random.randint(1, 100)/100)
@@ -92,17 +111,39 @@ def get_article_contents(url: str, raw_html_dump: dict,titles: dict):
 
 def main():
     st.write('# Opine Search')
-    text = st.text_input('Enter search terms').replace(' ', '+')
+    text = st.text_input('Enter search terms')
+    MAX_THREADS = st.number_input('Results to find (max 50): ', min_value=1, max_value=50, value=10)
     if text is not '':
-        PARAMS = {'query':text,
-            'judge':'',
-            'party':'','order':'relevance','page':'1','per_page':'50'}
+        param_xml = get_response(f'Here is a user\'s search query for a UK legal database:\n<query>{text}</query>\nUse this query to fill out the following JSON fields. For example, if the user types "Crown" or "R." the party field should contain "r". The to_date_X and from_date_X fields contain the year, month, and day of the query. For example, "To 1st May 2020" should be to_date_0: 1, to_date_1: 5, to_date_2: 2020. Respond in this format:\n\n<format>\n<query>any query keywords</query>\n<judge>names of judges</judge>\n<party>names of any parties</party>\n<from_date_0>day to start searching (if not specified, do not fill in)</from_date_0><from_date_1>month to start searching (if not specified, do not fill in)</from_date_1><from_date_2>year to start searching (if not specified, do not fill in)</from_date_2>\n<to_date_0>day to stop searching (if not specified, do not fill in)</to_date_0><to_date_1>month to stop searching (if not specified, do not fill in)</to_date_1><to_date_2>year to start searching (if not specified, do not fill in)</to_date_2>\n</format>')
+        logging.info(param_xml)
+        try:
+            param_xml = param_xml.split('<format>')[1].split('</format>')[0]
+        except IndexError:
+            param_xml = param_xml
+        try:
+            param_xml = '<xml>'+param_xml.replace('\n','')+'</xml>'
+            logging.info(param_xml)
+            PARAMS = json.dumps(xmltodict.parse(param_xml)).replace('null', '""')
+            print('json_stringis', PARAMS)
+            PARAMS = json.loads(PARAMS)['xml']
+            print('dictis', PARAMS)
+
+            PARAMS['order'] = 'relevance'
+            PARAMS['page'] = '1'
+            PARAMS['per_page'] = '50'
+        except Exception as e:
+            logging.warn(e)
+            logging.warn('Degrading to dumb search')
+            PARAMS = {'query':text,
+                      'judge':'',
+                      'party':'',
+                      'order':'relevance','page':'1','per_page':'50'}
+
         r = requests.get(URL, params=PARAMS)
         soup = BeautifulSoup(r.text, 'html.parser')
 
         raw_links = soup.find_all("span",class_="judgment-listing__title" )
         links = []
-        st.write(f'Found {len(raw_links)} hits.')
         i = 0
         raw_html_dump = {}
         summaries = {}
@@ -110,7 +151,11 @@ def main():
         master_threads= []
         for link in raw_links:
             links.append(link.find('a')['href'])
+        links.sort(key=get_importance_of_case)
+
         links = links[:MAX_THREADS]
+        st.write(f'Found {len(links)} hits.')
+
         for link in links:
             i += 1
             if i > MAX_THREADS:
@@ -129,9 +174,11 @@ def main():
 
         checkboxes = []
         select_titles = []
-        for link in links:
-            x = st.write(f'[{titles[link]}]({BASE_URL+"/"+link})')
-            select_titles.append(titles[link])
+        with st.sidebar:
+            st.write('## Cases')
+            for link in links:
+                x = st.write(f'[({get_prefix(link)}) {titles[link]}]({BASE_URL+"/"+link})')
+                select_titles.append(titles[link])
 
         select_to_analyse = st.multiselect('Select cases to summarise', select_titles)
 
@@ -139,6 +186,7 @@ def main():
         if st.button('Generate Report'):
             summary_dump = {}
             selected_links = [links[select_titles.index(_)] for _ in select_to_analyse]
+            selected_links.sort(key=get_importance_of_case)
             threads = []
             for link in selected_links:
                 s_thread = threading.Thread(target=get_article_summary, args=(link,summary_dump,raw_html_dump))
